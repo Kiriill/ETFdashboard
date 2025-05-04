@@ -1,0 +1,10 @@
+name: ASXETFdashboard
+title:
+username: kiriillb
+account: kiriillb
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 14442283
+bundleId: 10064576
+url: https://kiriillb.shinyapps.io/ASXETFdashboard/
+version: 1

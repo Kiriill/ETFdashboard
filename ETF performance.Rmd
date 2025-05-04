@@ -1,0 +1,349 @@
+---
+title: "Best performing ETFs"
+author: "Kiriill Butler"
+date: "2025-05-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load required libraries
+library(tidyverse)    # for data manipulation and piping
+library(readxl)       # for reading Excel files
+library(rvest)        # for web scraping report listing
+library(lubridate)    # for date arithmetic
+library(yfR)          # for Yahoo Finance data retrieval
+```
+
+```{r}
+# Dynamically find the latest monthly Investment Products Excel report
+report_url <- "https://www.asx.com.au/issuers/investment-products/asx-investment-products-monthly-report"
+page <- read_html(report_url)
+
+# Extract all hrefs and filter for Excel reports
+links <- page %>% 
+  html_nodes("a") %>% 
+  html_attr("href") %>% 
+  discard(is.na)
+xlsx_links <- links %>% 
+  keep(~ str_detect(.x, regex("asx-investment-products-.*-abs\\.xlsx$", ignore_case = TRUE))) %>% 
+  unique()
+
+# Build full URLs
+full_links <- xlsx_links %>% 
+  map_chr(~ if (str_detect(.x, "^https?://")) .x else str_c("https://www.asx.com.au", .x))
+
+# Parse month-year from filename and convert to date for ordering
+mth_year <- str_extract(full_links, regex("(?<=products-)[A-Za-z]{3}-\\d{4}(?=-abs\\.xlsx)", ignore_case = TRUE))
+report_dates <- parse_date_time(mth_year, "b-Y", locale = "en")
+
+# Select the most recent report URL
+valid_idx <- which(!is.na(report_dates))
+latest_url <- full_links[valid_idx][which.max(report_dates[valid_idx])]
+```
+
+```{r}
+# Download and read the Spotlight ETP List sheet
+temp_file <- tempfile(fileext = ".xlsx")
+download.file(latest_url, destfile = temp_file, mode = "wb")
+etp_list <- read_excel(
+  temp_file,
+  sheet     = "Spotlight ETP List",
+  skip      = 9,           # skip first 9 rows so the 10th row becomes header
+  col_types = "text"
+)
+```
+
+```{r}
+# Clean column names: remove carriage returns and line breaks
+colnames(etp_list) <- colnames(etp_list) %>%
+  str_replace_all("[\r\n]", " ") %>%    # replace CR/LF with space
+  str_squish()                               # trim extra whitespace
+```
+
+```{r}
+# Extract and clean unique ASX codes
+etf_symbols <- etp_list %>%
+  pull('ASX Code') %>%                           # extract 'ASX Code' column
+  str_subset("^[A-Z0-9]+$") %>%                # keep valid ticker codes
+  unique() %>%                                   # remove duplicates
+  paste0(".AX")                                # append ASX suffix for Yahoo Finance 
+```
+
+```{r}
+# Create a lookup table for fund name and issuer
+fund_info <- etp_list %>%
+  transmute(
+    symbol = paste0(`ASX Code`, ".AX"),
+    Fund   = `Fund Name`,
+    Issuer = `Issuer`
+  )
+```
+
+```{r}
+# Define evaluation periods and their start dates
+periods <- tibble(
+  period     = c("1m", "1y", "5y", "10y"),
+  start_date = as_date(c(
+    Sys.Date() %m-% months(1),
+    Sys.Date() %m-% years(1),
+    Sys.Date() %m-% years(5),
+    Sys.Date() %m-% years(10)
+  ))
+)
+}
+```
+
+```{r}
+'''
+# Fetch price data efficiently:
+# - daily data for last month
+# - monthly data for longer horizons
+earliest_date <- min(periods$start_date)
+
+daily_raw <- yf_get(
+  tickers            = etf_symbols,
+  first_date         = Sys.Date() %m-% months(1),
+  last_date          = Sys.Date(),
+  freq_data          = "daily",
+  do_parallel        = FALSE,
+  thresh_bad_data    = 0
+)
+
+daily_raw = select(daily_raw,
+                  symbol   = ticker,
+                  date     = ref_date,
+                  adjusted = price_adjusted
+)
+
+# Monthly for 1y, 5y, 10y TSR
+monthly_raw <- yf_get(
+  tickers            = etf_symbols,
+  first_date         = earliest_date,
+  last_date          = Sys.Date(),
+  freq_data          = "monthly",
+  do_parallel        = FALSE,
+  thresh_bad_data    = 0,
+) %>%
+  select(
+    ticker,
+    date_original = ref_date,
+    price_orig    = price_adjusted
+  )
+'''
+```
+
+```{r}
+# Fetch price data efficiently:
+# - daily data for last month (with buffer for non-trading days)
+# - monthly data for longer horizons (with buffer for anniversary non-trading days)
+buffer_days <- 5
+earliest_date   <- min(periods$start_date)
+earliest_buffer <- earliest_date %m-% days(buffer_days)
+
+# Daily for 1-month TSR without pipe
+daily_raw <- yf_get(
+    tickers           = etf_symbols,
+    first_date        = (Sys.Date() %m-% months(1)) %m-% days(buffer_days),  # add buffer
+    last_date         = Sys.Date(),
+    freq_data         = "daily",
+    do_parallel       = FALSE,
+    thresh_bad_data   = 0
+  )
+```
+
+```{r}
+daily_raw <- select(
+                    daily_raw,
+                    symbol   = ticker,
+                    date     = ref_date,
+                    adjusted = price_adjusted
+)
+```
+
+```{r}
+# Monthly for 1y, 5y, 10y TSR without pipe
+monthly_raw <- yf_get(
+    tickers           = etf_symbols,
+    first_date        = earliest_buffer,  # buffer before earliest start date
+    last_date         = Sys.Date(),
+    freq_data         = "monthly",
+    do_parallel       = FALSE,
+    thresh_bad_data   = 0
+  )
+```
+
+```{r}
+monthly_raw <- select(
+  monthly_raw,
+  symbol   = ticker,
+  date     = ref_date,
+  adjusted = price_adjusted
+)
+```
+
+```{r}
+# Combine and dedupe price data
+all_prices <- bind_rows(daily_raw, monthly_raw) %>%
+  distinct(symbol, date, .keep_all = TRUE) %>%
+  arrange(symbol, date)
+```
+
+```{r}
+# Compute TSR per period with robust handling of missing data
+results <- tibble(
+  symbol = character(),
+  period = character(),
+  tsr    = double()
+)
+```
+
+```{r}
+# Loop over each period explicitly to roll prices
+for (i in seq_len(nrow(periods))) {
+  per <- periods$period[i]
+  sd  <- periods$start_date[i]
+
+  # Prepare storage for this period
+  period_results <- tibble(symbol = character(), tsr = double())
+
+  # Iterate over each ETF symbol
+  for (sym in etf_symbols) {
+    df_sym <- all_prices %>% filter(symbol == sym)
+    
+    # Determine starting price: exact date if available, else fallback within buffer
+    if (sd %in% df_sym$date) {
+      start_price <- df_sym %>% filter(date == sd) %>% pull(adjusted)
+    } else {
+      # fallback to last available price within buffer days before start date
+      start_candidate <- df_sym %>%
+        filter(date <= sd, date >= sd %m-% days(buffer_days))
+      if (nrow(start_candidate) == 0) next  # skip if no buffer data
+      start_price <- start_candidate %>% slice_max(date) %>% pull(adjusted)
+    }
+    
+    # Determine ending price: most recent available on or before today
+    end_candidate <- df_sym %>% filter(date <= Sys.Date())
+    if (nrow(end_candidate) == 0) next
+    end_price <- end_candidate %>% slice_max(date) %>% pull(adjusted)
+
+    # Calculate TSR (%)
+    tsr_val <- (end_price / start_price - 1) * 100
+    period_results <- bind_rows(period_results, tibble(symbol = sym, tsr = tsr_val))
+  }
+
+  # Append period label and combine
+  if (nrow(period_results) > 0) {
+    period_results <- period_results %>% mutate(period = per)
+    results <- bind_rows(results, period_results)
+  }
+}
+```
+
+```{r}
+# Rank and assemble summary table
+summary_table <- results %>%
+  group_by(period) %>%
+  arrange(desc(tsr), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  ungroup() %>%
+  select(symbol, period, tsr, rank) %>%
+  pivot_wider(
+    names_from  = period,
+    values_from = c(tsr, rank),
+    names_glue  = "{.value}_{period}"
+  ) %>%
+  left_join(fund_info, by = "symbol")  # add Fund and Issuer columns,
+    names_glue  = "{.value}_{period}"
+  
+```
+
+```{r}
+# Output the summary
+print(summary_table)
+```
+
+```{r}
+  # Build summary_table and top10_list
+  summary_table <- results %>%
+    group_by(period) %>% arrange(desc(tsr), .by_group = TRUE) %>%
+    mutate(rank = row_number()) %>% ungroup() %>%
+    select(symbol, period, tsr, rank) %>%
+    pivot_wider(names_from = period, values_from = c(tsr, rank), names_glue = "{.value}_{period}") %>%
+    left_join(fund_info, by = "symbol")
+
+  top10_list <- map(periods$period, function(per) {
+    col <- paste0("tsr_", per)
+    summary_table %>%
+      select(symbol, Fund, Issuer, tsr = !!rlang::sym(col)) %>%
+      arrange(desc(tsr)) %>% slice_head(n = 10) %>%
+      mutate(
+        TSR = sprintf("%.1f%%", tsr),
+        Annual = case_when(
+          per == "1m" ~ sprintf("%.1f%%", ((1 + tsr/100)^12 - 1) * 100),
+          per == "1y" ~ sprintf("%.1f%%", tsr),
+          per == "5y" ~ sprintf("%.1f%%", ((1 + tsr/100)^(1/5) - 1) * 100),
+          per == "10y" ~ sprintf("%.1f%%", ((1 + tsr/100)^(1/10) - 1) * 100)
+        )
+      )
+  })
+  names(top10_list) <- periods$period
+  saveRDS(top10_list, "top10_list.rds")
+```
+
+```{r}
+# Define UI
+ui <- fluidPage(
+  titlePanel("Top Performing ASX-listed ETFs"),
+  # Stack tables vertically in reverse period order
+  lapply(rev(names(top10_list)), function(per) {
+    # Add spacing between tables
+    fluidRow(
+      style = "margin-bottom: 40px;",
+      column(
+        width = 12,
+        h4(
+          switch(per,
+            "1m" = "Last Month",
+            "1y" = "Last Year",
+            "5y" = "Last 5 Years",
+            "10y" = "Last 10 Years"
+          )
+        ),
+        DTOutput(outputId = paste0("tbl_", per))
+      )
+    )
+  }),
+)  # Close fluidPage
+
+# Define server
+server <- function(input, output, session) {
+  lapply(names(top10_list), function(per) {
+    df <- top10_list[[per]] %>%
+      mutate(
+        Medal = case_when(
+          row_number() == 1 ~ "🥇",
+          row_number() == 2 ~ "🥈",
+          row_number() == 3 ~ "🥉",
+          TRUE               ~ ""
+        )
+      ) %>%
+      select(Medal, Fund, Issuer, TSR, Annual)
+
+    output[[paste0("tbl_", per)]] <- renderDT({
+      datatable(
+        df,
+        rownames = FALSE,
+        colnames = c("", "Fund", "Issuer", "TSR", "Annual"),  # hide emoji column header
+        options = list(dom = 't', pageLength = 10)
+      )
+    })
+  })
+}
+
+# Run the app
+shinyApp(ui, server)
+```
